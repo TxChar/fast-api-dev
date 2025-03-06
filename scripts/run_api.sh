@@ -1,1 +1,2 @@
-fastapi dev main.py
+# fastapi dev main.py
+uvicorn main:app --reload
