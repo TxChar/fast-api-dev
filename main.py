@@ -1,82 +1,84 @@
-from typing import Union
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel, Field
-from bson.objectid import ObjectId
-from pymongo import MongoClient
-from typing import Optional
+import os
 
+import aioredis
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
+from motor.motor_asyncio import AsyncIOMotorClient
+from starlette.responses import RedirectResponse
+
+from config import settings
+from openapi import initialise_openapi
+from routers import router
+
+# app object
 app = FastAPI()
 
-client = MongoClient("mongodb://localhost:27017/")
 
-db = client["votes"]
-collection = db["votes"]
+origins = ["http://localhost:3000"]
 
-
-class Vote(BaseModel):
-    name: str
-    count: int = Field(default=0)
-    is_deleted: Optional[bool] = Field(default=False, exclude=True)
-
-    class Config:
-        schema_extra = {"example": {"name": "string", "count": 0}}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-@app.get("/")
-def read_root():
-    return {"Message": "Hello World"}
+@app.on_event("startup")
+async def startup_event():
+    try:
+        app.mongodb_client = AsyncIOMotorClient(settings.MONGODB_URL)
+        app.mongodb = app.mongodb_client[settings.MONGODB_NAME]
+    except Exception as e:
+        logger.error(f"Failed to connect with MongoDB: {e}.")
+    else:
+        logger.info("Connect to MongoDB ✅")
+
+    try:
+        redis = await aioredis.from_url(settings.REDIS_DB)
+        app.redis = redis
+    except Exception as e:
+        logger.error(f"Failed to connect with Redis: {e}.")
+    else:
+        logger.info("Connect to Redis ✅")
 
 
-# Create
-@app.post("/votes/")
-async def create_vote(vote: Vote):
-    result = collection.insert_one(vote.dict())
-    return {
-        "id": str(result.inserted_id),
-        "name": vote.name,
-        "count": vote.count,
-    }
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    logger.info("OdeServer Shutdown 💤")
+
+    try:
+        app.mongodb_client.close()
+    except Exception as e:
+        logger.error(f"Failed to close connection w/ MongoDB: {e}.")
+    else:
+        logger.info("Close connection w/ MongoDB 💤")
 
 
-@app.get("/votes/{vote_id}")
-async def get_vote(vote_id: str):
-    vote = collection.find_one(
-        {"_id": ObjectId(vote_id), "is_deleted": False}
-    )  # ดึงเฉพาะที่ยังไม่ถูกลบ
-    if vote:
+@app.get("/", include_in_schema=False)
+async def get_root():
+    if (root_url := os.environ.get("ROOT_URL")) is None:
         return {
-            "id": str(vote["_id"]),
-            "name": vote["name"],
-            "count": vote["count"],
+            "api_docs": {"openapi": f"{root_url}/docs", "redoc": f"{root_url}/redoc"}
         }
-    else:
-        raise HTTPException(status_code=404, detail="Vote not found")
+
+    response = RedirectResponse(url=f"{root_url}/docs")
+    return response
 
 
-@app.put("/votes/{vote_id}")
-async def update_vote(vote_id: str, vote: Vote):
-    result = collection.update_one(
-        {"_id": ObjectId(vote_id)},
-        {"$set": vote.dict(exclude_unset=True)},
+app.include_router(router, tags=["Todo"], prefix="/api/v1/task")
+
+
+initialise_openapi(app)
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=settings.HOST,
+        reload=settings.DEBUG_MODE,
+        port=settings.PORT,
     )
-
-    if result.modified_count == 1:
-        return {
-            "id": vote_id,
-            "name": vote.name,
-            "count": vote.count,
-        }
-    else:
-        raise HTTPException(status_code=404, detail="Vote not found")
-
-
-@app.delete("/votes/{vote_id}")
-async def delete_vote(vote_id: str):
-    result = collection.update_one(
-        {"_id": ObjectId(vote_id)}, {"$set": {"is_deleted": True}}
-    )
-
-    if result.modified_count == 1:
-        return {"message": "Vote deleted", "id": vote_id}
-    else:
-        raise HTTPException(status_code=404, detail="Vote not found or already deleted")
